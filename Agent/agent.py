@@ -32,8 +32,8 @@ class BaseAgent:
         self.model = model
         self.this_task:str = ""
         self.workspace = workspace
-        self.chat_history :list[dict] = []
-        self.llm_response:list[dict] = []
+        self.chat_history: list[dict] = []
+        self.llm_response: list[dict] = []
         self.current_cost = 0.0
         logger.info(f"Agent initialized with model: {model.model_name}")
 
