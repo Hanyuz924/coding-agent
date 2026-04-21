@@ -2,7 +2,13 @@ import json
 import time
 import logging
 import litellm
-from typing import Any
+from typing import Any, Generator
+from enum import Enum
+
+class ChunkType(Enum):
+    TEXT = "text"
+    THINKING = "thinking"
+    TOOL_CALL = "tool_call", Generator
 from jinja2 import StrictUndefined, Template
 from pydantic import BaseModel, Field
 
@@ -49,18 +55,44 @@ class BaseModelClass:
     def pre_process_prompt(self):
         pass
     
-    def call_llm_api(self, prompt: list[dict[str, str]]):
+    def call_llm_api(self, prompt: list[dict[str, str]]) -> Generator[dict, None, None]:
+        """
+        Yields dicts with shape:
+          {"type": ChunkType.TEXT,      "content": str}
+          {"type": ChunkType.THINKING,  "content": str}
+          {"type": ChunkType.TOOL_CALL, "index": int, "id": str, "name": str, "arguments": str}
+        """
         try:
             logger.info(f"Calling LLM API with model={self.model_name}, {len(prompt)} messages")
-            logger.info(f"Prompt messages: {prompt}")
-            response = litellm.completion(
-                model= self.model_name,
+            logger.debug(f"Prompt messages: {prompt}")
+            token_count = litellm.token_counter(model=self.model_name, messages=prompt)
+            logger.info(f"Token count: {token_count}")
+            stream = litellm.completion(
+                model=self.model_name,
                 messages=prompt,
                 tools=[BASH_TOOL],
+                stream=True,
                 **self.config.model_kwargs
             )
-            logger.info(f"LLM API response received: {response}")
-            return response
+            for chunk in stream:
+                delta = chunk.choices[0].delta
+
+                if delta.thinking:
+                    yield {"type": ChunkType.THINKING, "content": delta.thinking}
+
+                if delta.content:
+                    yield {"type": ChunkType.TEXT, "content": delta.content}
+
+                if delta.tool_calls:
+                    for tc in delta.tool_calls:
+                        yield {
+                            "type": ChunkType.TOOL_CALL,
+                            "index": tc.index,
+                            "id": tc.id or "",
+                            "name": tc.function.name or "",
+                            "arguments": tc.function.arguments or "",
+                        }
+
         except litellm.exceptions.AuthenticationError as e:
             logger.error(f"Authentication error: {e}")
             e.message += " You can permanently set your API key with `mini-extra config set KEY VALUE`."
@@ -129,13 +161,6 @@ class BaseModelClass:
 
             msg = {
                 "content": content,
-                # "extra": {
-                #     "raw_output": output.get("output", ""),
-                #     "returncode": output.get("returncode"),
-                #     "timestamp": time.time(),
-                #     "exception_info": output.get("exception_info"),
-                #     **output.get("extra", {}),
-                # },
             }
             if action.get("tool_call_id", None) is not None:
                 msg["tool_call_id"] = action.get("tool_call_id")
