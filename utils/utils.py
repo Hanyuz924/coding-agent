@@ -6,9 +6,17 @@ from rich.logging import RichHandler
 LOGGER_NAME = "myagent"
 UNSET = object()
 
-def setup_logger(console_log:bool = False) -> logging.Logger:
+LOG_LEVEL_MAP: dict[str, int] = {
+    "debug":    logging.DEBUG,
+    "info":     logging.INFO,
+    "warning":  logging.WARNING,
+    "error":    logging.ERROR,
+    "critical": logging.CRITICAL,
+}
+
+def setup_logger(console_log:bool = False, log_level: str = "debug" ) -> logging.Logger:
     logger = logging.getLogger(LOGGER_NAME)
-    logger.setLevel(logging.DEBUG)
+    logger.setLevel(LOG_LEVEL_MAP[log_level])
     logger.propagate = False
 
     if logger.handlers:

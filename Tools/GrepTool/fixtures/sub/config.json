@@ -1,0 +1,9 @@
+{
+  "project": "sample-project",
+  "version": "1.0.0",
+  "debug": false,
+  "greeting": "Hello",
+  "max_connections": 10,
+  "timeout": 30,
+  "allowed_hosts": ["localhost", "127.0.0.1"]
+}

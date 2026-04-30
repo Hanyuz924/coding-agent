@@ -2,9 +2,8 @@ import json
 import time
 import logging
 import anthropic
-from typing import Generator
-from enum import Enum
-from jinja2 import StrictUndefined, Template
+from typing import Generator, cast
+from anthropic.types import ToolParam
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger("myagent.model")
@@ -16,6 +15,18 @@ _MODEL_PRICING: dict[str, tuple[float, float]] = {
     "claude-haiku-4-5":  (1.00,  5.00),
 }
 
+
+MODEL_CONTEXT = {
+    "claude-opus-4-6": 200000,
+    "claude-sonnet-4-6": 200000,
+    "claude-sonnet-4-20250514": 200000,
+    "claude-haiku-4-5-20251001": 200000,
+    "claude-opus-4-20250514": 200000,
+}
+
+def get_context_window(model: str) -> int:
+    return 50_000 #test purpose
+    # return MODEL_CONTEXT.get(model, 200000)
 
 class TextChunk:
     def __init__(self, text): self.text = text
@@ -40,35 +51,26 @@ class UsageChunk:
         self.cost = cost
 
 
-#TODO change the model config and prompt 
-class ModelConfig(BaseModel):
-    model_name: str
-    model_kwargs: dict = Field(default_factory=dict)
-
-    format_error_template: str = "{{ error }}"
-    observation_template: str = (
-        "<returncode>{{output.returncode}}</returncode>\n"
-        "<output>\n{{output.output}}</output>"
-    )
-
-
 class AnthropicModelClass:
-    def __init__(self, model_name: str, config: ModelConfig) -> None:
+    def __init__(self, model_name: str, api_key: str | None = None) -> None:
         self.model_name = model_name
-        self.config = config
-        self.client = anthropic.Anthropic()
+        self.client = anthropic.Anthropic(api_key=api_key)
         logger.info(f"AnthropicModelClass initialized with model: {model_name}")
-        logger.debug(f"Model config: {config}")
-
-    def get_template_variable(self) -> dict:
-        return self.config.model_dump()
-
-    def pre_process_prompt(self):
-        pass
 
     # ------------------------------------------------------------------ #
     # Streaming                                                            #
     # ------------------------------------------------------------------ #
+
+
+
+    def _make_cached_system(self, system_message:str) -> list:
+        return [{"type":"text", "text": system_message, "cache_control":{"type":"ephemeral"}}]
+
+    def _make_cached_tool_schema(self, tool_use_schema: list[dict]) -> list[dict]:
+        tools = tool_use_schema.copy()
+        if tools:
+            tools[-1] = {**tools[-1], "cache_control": {"type": "ephemeral"}}
+        return tools
 
     """
     Anthropic API need merge the tool result from different tools to a single user message :
@@ -150,13 +152,13 @@ class AnthropicModelClass:
 
         try:
             #TODO get from config and set a default value 
-            max_tokens = 16000
+            max_tokens = 32000
             kwargs = {
                 "model": self.model_name,
                 "max_tokens":max_tokens,
-                "system":system_message,
-                "message": self.prepare_anthropic_message(messages),
-                "tools":tool_use_schemas                   
+                "system":self._make_cached_system(system_message),
+                "messages": self.prepare_anthropic_message(messages),
+                "tools":self._make_cached_tool_schema(tool_use_schemas)                   
             }
             text = ""
             
@@ -177,7 +179,6 @@ class AnthropicModelClass:
 
                 for block in final.content:
                     if block.type == "tool_use":
-                        #TODO may be we need a generic output format for tool use wrapper ? ??
                         tool_calls.append({
                             "id" : block.id,
                             "name": block.name,
@@ -191,9 +192,26 @@ class AnthropicModelClass:
                     stop_reason=final.stop_reason,
                     usage=final.usage
                 )
+        except anthropic.RateLimitError as e:
+            logger.warning(f"Rate limit hit: {e}")
+            raise
         except anthropic.AuthenticationError as e:
             logger.error(f"Authentication error: {e}")
             raise
+
+    def count_tokens_api(
+        self,      
+        system_message:str,
+        tool_use_schemas:list,
+        messages: list,
+    ) -> int:
+        response = self.client.messages.count_tokens(
+            model=self.model_name,
+            system=self._make_cached_system(system_message),
+            messages=self.prepare_anthropic_message(messages),
+            tools=cast(list[ToolParam], self._make_cached_tool_schema(tool_use_schemas)),
+        )
+        return response.input_tokens
 
     def collect_stream(
             self, 
@@ -206,8 +224,8 @@ class AnthropicModelClass:
         Use this when you need the full response for parse_actions / parse_response
         without consuming streaming chunks manually.
         """
-        kwargs = dict(self.config.model_kwargs)
-        max_tokens = kwargs.pop("max_tokens", 16000)
+
+        max_tokens = 16000
         with self.client.messages.stream(
             model=self.model_name,
             system=system_message,
