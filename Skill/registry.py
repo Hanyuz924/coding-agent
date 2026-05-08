@@ -2,6 +2,9 @@ from Skill.skill import SkillDefinition, _parse_skill_file, _parse_skill_args
 from Agent.agent import AgentState, BaseAgent
 from typing import Generator
 from pathlib import Path
+import logging
+
+logger = logging.getLogger("myagent.skill")
 
 _SKILL_REGISTRY: dict[str, SkillDefinition] = {}
 _TRIGGER_MAP: dict[str, SkillDefinition] = {}  # "/commit" -> skill
@@ -52,6 +55,7 @@ def execute_skill(
     system_prompt: str,
     named_args: list[str] | None = None,
 ) -> Generator:
+    logger.info(f"Skill triggered: {skill.name}, arguments: {args if args else '(none)'}")
     skill_content = _parse_skill_args(skill.prompt_template, args, named_args)
     message = f"[Skill: {skill.name}]\n\n{skill_content}"
 

@@ -170,8 +170,6 @@ class GrepTool(BaseTool):
     def execute(self, ctx:ToolUseContext, cwd: Optional[str] = None, **kwargs) -> ToolResult:
         cwd = cwd or os.getcwd()
         #default path should set to cwd
-        #TODO if there is error need to be caught 
-        
         if not kwargs.get("path", None):
             kwargs["path"] = cwd
         kwargs["path"] = expandPath(kwargs["path"])
