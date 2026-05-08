@@ -2,7 +2,7 @@
 
 ## Pending
 
-- [ ] **Fix `prepare_anthropic_message()` performance**
+- [ x ] **Fix `prepare_anthropic_message()` performance**
   - Currently re-processes the entire message list on every API call
   - Option: incremental conversion — cache prepared list + track `_prepared_until` index in `AgentState`
   - Option: store messages in Anthropic wire format directly, eliminating conversion entirely

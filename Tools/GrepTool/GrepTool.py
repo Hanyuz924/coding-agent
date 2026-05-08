@@ -167,8 +167,13 @@ class GrepTool(BaseTool):
         logger.debug(f"[{self.name}] : glob flag search pattern after split {patterns}")
         return patterns
     
-    def execute(self,ctx:ToolUseContext, cwd: Optional[str] = None, **kwargs) -> ToolResult:
+    def execute(self, ctx:ToolUseContext, cwd: Optional[str] = None, **kwargs) -> ToolResult:
         cwd = cwd or os.getcwd()
+        #default path should set to cwd
+        #TODO if there is error need to be caught 
+        
+        if not kwargs.get("path", None):
+            kwargs["path"] = cwd
         kwargs["path"] = expandPath(kwargs["path"])
         logger.debug(f"[{self.name}] -- cwd: {cwd}, absolute path {kwargs['path']}")
         input = GrepToolInput(**kwargs)
@@ -185,7 +190,7 @@ class GrepTool(BaseTool):
         if input.show_line_numbers and input.output_mode == "content":
             args.append("-n")
 
-                # Patterns starting with '-' must use -e to avoid being parsed as flags
+        # Patterns starting with '-' must use -e to avoid being parsed as flags
         if input.pattern.startswith("-"):
             args += ["-e", input.pattern]
         else:

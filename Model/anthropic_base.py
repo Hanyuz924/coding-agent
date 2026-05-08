@@ -15,6 +15,13 @@ _MODEL_PRICING: dict[str, tuple[float, float]] = {
     "claude-haiku-4-5":  (1.00,  5.00),
 }
 
+MODEL_MAX_OUTPUT = {
+    "claude-opus-4-7":              16_000,
+    "claude-opus-4-20250514":       16_000,
+    "claude-sonnet-4-6":            16_000,
+    "claude-sonnet-4-20250514":     16_000,
+    "claude-haiku-4-5-20251001":    16_000,
+}
 
 MODEL_CONTEXT = {
     "claude-opus-4-6": 200000,
@@ -23,9 +30,12 @@ MODEL_CONTEXT = {
     "claude-haiku-4-5-20251001": 200000,
     "claude-opus-4-20250514": 200000,
 }
+def get_max_output_tokens(model:str) -> int:
+    return 16_000
+    # return MODEL_MAX_OUTPUT.get(model, 16_000)
 
 def get_context_window(model: str) -> int:
-    return 50_000 #test purpose
+    return 25_000 #test purpose
     # return MODEL_CONTEXT.get(model, 200000)
 
 class TextChunk:
@@ -157,7 +167,7 @@ class AnthropicModelClass:
                 "model": self.model_name,
                 "max_tokens":max_tokens,
                 "system":self._make_cached_system(system_message),
-                "messages": self.prepare_anthropic_message(messages),
+                "messages": messages,
                 "tools":self._make_cached_tool_schema(tool_use_schemas)                   
             }
             text = ""
@@ -208,7 +218,7 @@ class AnthropicModelClass:
         response = self.client.messages.count_tokens(
             model=self.model_name,
             system=self._make_cached_system(system_message),
-            messages=self.prepare_anthropic_message(messages),
+            messages=messages,
             tools=cast(list[ToolParam], self._make_cached_tool_schema(tool_use_schemas)),
         )
         return response.input_tokens
@@ -229,7 +239,7 @@ class AnthropicModelClass:
         with self.client.messages.stream(
             model=self.model_name,
             system=system_message,
-            messages=self.prepare_anthropic_message(messages),
+            messages=messages,
             tools=tool_use_schemas,
             max_tokens=max_tokens,
         ) as stream:
