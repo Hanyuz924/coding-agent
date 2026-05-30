@@ -15,6 +15,7 @@ from Tools import BaseTool
 from Tools.permission_check import check_permission
 from Tools.registry import dispatch, get_tool_schemas
 from Agent.compact import CompactionMixin
+from MCP.client import MCPManager
 
 logger = logging.getLogger("myagent.agent")
 
@@ -112,11 +113,12 @@ class BaseAgent(CompactionMixin):
         self.model = model
         self.last_api_call_time = None
         self.effective_context_window = get_context_window(self.model.model_name)
-
+        self.MCP_manager = MCPManager()
         
         self.current_cost = 0.0
         logger.info(f"Agent initialized with model: {model.model_name}")
-    
+
+
     def _estimate_tokens(self, messages: list,) -> int:
         total_chars = 0
         message_count = 0
@@ -154,7 +156,7 @@ class BaseAgent(CompactionMixin):
     For continue conversation, we need to use the chat history 
     After each turn end, we need to add the messsage back to chat history?
 
-    TBD: do we need to take new sysrem prompt everytime, every turn ?
+    TBD: do we need to take new system prompt everytime, every turn ?
 
     Multi-turn agent loop (generator) streaming purpose.
     Yields: TextChunk | ThinkingChunk | ToolStart | ToolEnd |
