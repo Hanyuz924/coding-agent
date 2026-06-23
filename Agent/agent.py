@@ -16,6 +16,10 @@ from Tools.permission_check import check_permission
 from Tools.registry import dispatch, get_tool_schemas
 from Agent.compact import CompactionMixin
 from MCP.client import MCPManager
+from utils.tracer import LANGFUSE_MAX_CONTENT, _truncate_for_langfuse
+import uuid
+
+from langfuse import get_client, propagate_attributes
 
 logger = logging.getLogger("myagent.agent")
 
@@ -115,6 +119,9 @@ class BaseAgent(CompactionMixin):
         self.effective_context_window = get_context_window(self.model.model_name)
         self.MCP_manager = MCPManager()
         
+        self.langfuse = get_client()
+        self.session_id = uuid.uuid4().hex[:12]
+
         self.current_cost = 0.0
         logger.info(f"Agent initialized with model: {model.model_name}")
 
@@ -174,120 +181,178 @@ class BaseAgent(CompactionMixin):
         new_user_message = {"role": "user", "content":user_message}
         state.messages.append(new_user_message)
         state.current_turn_number +=1
-        while 1 :
-            assistant_turn: AssistantTurn | None = None
-            #for every api call check sinp tool result and microcompat 
-            self._snip_tool_use_result(state)
-            self._microcompact_anthropic(state)
-            
-            #add retry for LLM call to, we may see rate limit error
-            for attempt in range(max_retry + 1):
-                try:
-                    for stream in self.model.stream_anthropic(
-                        system_message= system_prompt,
-                        tool_use_schemas=get_tool_schemas(),
-                        messages=state.messages
-                    ):
-                        if isinstance(stream, (ThinkingChunk, TextChunk)):
-                            yield stream
-                        elif isinstance(stream, AssistantTurn):
-                            assistant_turn = stream
-                    if assistant_turn is not None:
-                        break
-                except (anthropic.RateLimitError, anthropic.APIConnectionError, anthropic.APITimeoutError) as e:
-                    if attempt >= max_retry:
-                        raise
-                    wait = 2 ** (attempt + 1)
-                    logger.warning(f"{type(e).__name__}, retrying in {wait}s (attempt {attempt + 1}/{max_retry})")
-                    time.sleep(wait)
-                except Exception as e:
-                    logger.error(f"Unexpected error during API call: {type(e).__name__}: {e}")
-                    raise
-            #This should only happen when 3 retry all reach the rate limit here
-            if assistant_turn is None:
-                break
-            self.last_api_call_time = time.time()
-            #At this point we got the actual assitant response here
-            assistant_content = []
-            if assistant_turn.text:
-                assistant_content.append({"type": "text", "text": assistant_turn.text})
-            for tc in assistant_turn.tool_calls:
-                assistant_content.append({
-                    "type": "tool_use",
-                    "id": tc["id"],
-                    "name": tc["name"],
-                    "input": tc["input"],
-                })
-            state.messages.append({"role": "assistant", "content": assistant_content})
-            state.turn_count += 1
-            state.total_input_tokens += assistant_turn.in_tokens
-            state.total_output_tokens += assistant_turn.out_tokens
-            #For streaming purpose just yield Turn done for UI 
-            yield TurnDone(assistant_turn.in_tokens, assistant_turn.out_tokens, assistant_turn.stop_reason)
 
-            if assistant_turn.stop_reason == "end_turn":
-                break# conversation round complete 
+        with propagate_attributes(session_id=self.session_id):
+            with self.langfuse.start_as_current_observation(
+                    as_type="span",
+                    name=f"turn_{state.current_turn_number}",
+                    input={"user_message": user_message},
+                ) as turn_span:
+                while 1 :
+                    assistant_turn: AssistantTurn | None = None
+                    #for every api call check sinp tool result and microcompat 
+                    self._snip_tool_use_result(state)
+                    self._microcompact_anthropic(state)
+                    last_message = state.messages[-1] if state.messages else {}
+                    with self.langfuse.start_as_current_observation(
+                        as_type="generation",
+                        name=f"chat {self.model.model_name}",
+                        model=self.model.model_name,
+                        input={
+                        "est_input_tokens": self._estimate_tokens(state.messages),
+                        "turn": state.current_turn_number,
+                        "last_message_role": last_message.get("role"),
+                        "last_message_preview": str(last_message.get("content"))[:200], 
+                    },
+                    ) as gen:
+                        #add retry for LLM call to, we may see rate limit error
+                        for attempt in range(max_retry + 1):
+                            try:
+                                for stream in self.model.stream_anthropic(
+                                    system_message= system_prompt,
+                                    tool_use_schemas=get_tool_schemas(),
+                                    messages=state.messages
+                                ):
+                                    if isinstance(stream, (ThinkingChunk, TextChunk)):
+                                        yield stream
+                                    elif isinstance(stream, AssistantTurn):
+                                        assistant_turn = stream
+                                if assistant_turn is not None:
+                                    break
+                            except (anthropic.RateLimitError, anthropic.APIConnectionError, anthropic.APITimeoutError) as e:
+                                if attempt >= max_retry:
+                                    raise
+                                wait = 2 ** (attempt + 1)
+                                logger.warning(f"{type(e).__name__}, retrying in {wait}s (attempt {attempt + 1}/{max_retry})")
+                                time.sleep(wait)
+                            except Exception as e:
+                                logger.error(f"Unexpected error during API call: {type(e).__name__}: {e}")
+                                raise
+                        if assistant_turn is not None:
+                            gen.update(
+                                output=assistant_turn.text,
+                                usage_details={
+                                    "input": assistant_turn.in_tokens,
+                                    "output": assistant_turn.out_tokens,
+                                },
+                                metadata={"stop_reason": assistant_turn.stop_reason},
+                            ) 
+                        
+                        #This should only happen when 3 retry all reach the rate limit here
+                        if assistant_turn is None:
+                            turn_span.update(
+                                level="ERROR",
+                                status_message="All retries exhausted (rate limit)",
+                            )
+                            break
+                        self.last_api_call_time = time.time()
+                        #At this point we got the actual assitant response here
+                        assistant_content = []
+                        if assistant_turn.text:
+                            assistant_content.append({"type": "text", "text": assistant_turn.text})
+                        for tc in assistant_turn.tool_calls:
+                            assistant_content.append({
+                                "type": "tool_use",
+                                "id": tc["id"],
+                                "name": tc["name"],
+                                "input": tc["input"],
+                            })
+                        state.messages.append({"role": "assistant", "content": assistant_content})
+                        state.turn_count += 1
+                        state.total_input_tokens += assistant_turn.in_tokens
+                        state.total_output_tokens += assistant_turn.out_tokens
+                        #For streaming purpose just yield Turn done for UI 
+                        yield TurnDone(assistant_turn.in_tokens, assistant_turn.out_tokens, assistant_turn.stop_reason)
 
-            #Handle Tool calls here and collect the tool call result info
-            tool_calls_result = []
-            for tool_call in assistant_turn.tool_calls:
-                yield ToolStart(name=tool_call["name"], inputs=tool_call["input"])
-                #1. For each tool call we check the permission first
-                permissions = check_permission(tool_call["name"], tool_call["input"])
-                if permissions["action"] == "deny":
-                    tool_calls_result.append({
-                        "type":"tool_result",
-                        "tool_use_id":tool_call["id"],
-                        "content":f"Action denied: {permissions.get('message', '')}"
-                    })
+                        if assistant_turn.stop_reason == "end_turn":
+                            turn_span.update(
+                                output=assistant_turn.text,    
+                                metadata={
+                                    "total_turns": state.turn_count,        
+                                    "total_input_tokens": state.total_input_tokens,
+                                    "total_output_tokens": state.total_output_tokens,
+                                },
+                            )
+                            break# conversation round complete 
+                        #TODO support async tool call 
+                        #Handle Tool calls here and collect the tool call result info
+                        tool_calls_result = []
+                        for tool_call in assistant_turn.tool_calls:
+                            yield ToolStart(name=tool_call["name"], inputs=tool_call["input"])
+                            #1. For each tool call we check the permission first
+                            with self.langfuse.start_as_current_observation(
+                                    as_type="span",
+                                    name=f"execute_tool {tool_call['name']}",
+                                    input=tool_call["input"],
+                                ) as tool_span:    
+                                permissions = check_permission(tool_call["name"], tool_call["input"])
+                                if permissions["action"] == "deny":
+                                    deny_message = {
+                                        "type":"tool_result",
+                                        "tool_use_id":tool_call["id"],
+                                        "content":f"Action denied: {permissions.get('message', '')}"
+                                    }
+                                    tool_calls_result.append(deny_message)
+                                    tool_span.update(level="WARNING", status_message="denied")
+                                    yield ToolEnd(name=tool_call["name"], result=None, permitted=False)
+                                    continue
 
-                    yield ToolEnd(name=tool_call["name"], result=None, permitted=False)
-                    continue
+                                if permissions["action"] == "confirm":
+                                    user_input_permission = PermissionRequest(
+                                        description=permissions["message"])
+                                    yield user_input_permission
+                                    if not user_input_permission.granted:
+                                        user_deny_message = {
+                                            "type":"tool_result",
+                                            "tool_use_id":tool_call["id"],
+                                            "content":"Action denied by user."
+                                        }
+                                        tool_calls_result.append(user_deny_message)
+                                        tool_span.update(level="WARNING", status_message="user_rejected")
+                                        yield ToolEnd(name=tool_call["name"], result=None, permitted=False)
+                                        continue
 
-                if permissions["action"] == "confirm":
-                    user_input_permission = PermissionRequest(
-                        description=permissions["message"])
-                    yield user_input_permission
-                    if not user_input_permission.granted:
-                        tool_calls_result.append({
-                            "type":"tool_result",
-                            "tool_use_id":tool_call["id"],
-                            "content":"Action denied by user."
-                        })
-                        yield ToolEnd(name=tool_call["name"], result=None, permitted=False)
-                        continue
-
-                tool_use_ctx = ToolUseContext(
-                    filecachestate=state.filecachestate,
-                    tooluse_id=tool_call["id"],
-                )
-                try:
-                    tool_result = dispatch(tool_name= tool_call["name"], tool_input=tool_call["input"], ctx=tool_use_ctx)
-                except Exception as e:
-                    logger.error(f"Tool execution error for {tool_call['name']}: {type(e).__name__}: {e}")
-                    tool_result = BaseTool.ToolResult(
-                        success=False,
-                        data=None,
-                        error=f"{type(e).__name__}: {str(e)}",
-                        metadata={"tool_name": tool_call["name"], "error_type": type(e).__name__}
-                    )
-                tool_calls_result.append({
-                    "type":"tool_result",
-                    "tool_use_id":tool_call["id"],
-                    "content":tool_result.to_api_content()
-                })
-                #only add the tool call to quick look up dict when there is actual tool call happen
-                state.tool_id_to_turn[tool_call["id"]] = {
-                    "tool_call_turn":state.current_turn_number,
-                    "tool_name":tool_call["name"]
-                }
-            state.messages.append({"role":"user", "content":tool_calls_result})
+                                tool_use_ctx = ToolUseContext(
+                                    filecachestate=state.filecachestate,
+                                    tooluse_id=tool_call["id"],
+                                )
+                                try:
+                                    tool_result = dispatch(tool_name= tool_call["name"], tool_input=tool_call["input"], ctx=tool_use_ctx)
+                                except Exception as e:
+                                    #TODO maybe we can add more structured error_message 
+                                    error_message = f"Tool execution error for {tool_call['name']}: {type(e).__name__}: {e}"
+                                    logger.error(error_message)
+                                    tool_result = BaseTool.ToolResult(
+                                        success=False,
+                                        data=None,
+                                        error=f"{type(e).__name__}: {str(e)}",
+                                        metadata={"tool_name": tool_call["name"], "error_type": type(e).__name__}
+                                    )
+                                tool_result_string = tool_result.to_string()
+                                tool_span.update(
+                                        output=_truncate_for_langfuse(tool_result_string),
+                                        level="ERROR" if not tool_result.success else "DEFAULT",
+                                        status_message=tool_result.error,
+                                )
+                            tool_calls_result.append({
+                                "type":"tool_result",
+                                "tool_use_id":tool_call["id"],
+                                "content":tool_result.to_api_content()
+                            })
+                            yield ToolEnd(name=tool_call["name"], result=tool_result, permitted=True)
+                            #only add the tool call to quick look up dict when there is actual tool call happen
+                            state.tool_id_to_turn[tool_call["id"]] = {
+                                "tool_call_turn":state.current_turn_number,
+                                "tool_name":tool_call["name"]
+                            }
+                        if tool_calls_result:
+                            state.messages.append({"role":"user", "content":tool_calls_result})
             self._check_and_compact(state,self.effective_context_window)
 
+                
     
-   
-    
-    
+        
+        
 
 
 

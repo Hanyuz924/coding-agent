@@ -137,7 +137,10 @@ def main() -> None:
                 print(event.text, end="", flush=True)
         print()
     else:
-        repl(agent_instance, system_prompt_str)
+        try:
+            repl(agent_instance, system_prompt_str)
+        finally:
+            agent_instance.langfuse.shutdown()
 
 
 if __name__ == "__main__":
