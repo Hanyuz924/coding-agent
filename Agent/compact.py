@@ -28,7 +28,6 @@ class CompactionMixin:
     def _snip_tool_use_result(self, state: AgentState) -> None:
         read_file_snip: dict = {}
         other_tool_snip: list = []
-        logger.debug(f"[Snip Tool Result] Current turn {state.current_turn_number}")
         for index, message in enumerate(state.messages):
             if message.get("role") != "user" and not isinstance(message.get("content"), list):
                 continue
@@ -52,13 +51,13 @@ class CompactionMixin:
         for message_index, tool_call_index in other_tool_snip:
             tool_id = state.messages[message_index]["content"][tool_call_index]["tool_use_id"]
             tool_info = self._get_tool_info(state, tool_id)  # type: ignore[attr-defined]
-            logger.debug(f"[Snip Tool Result]: tool={tool_info['name'] if tool_info else '?'} id={tool_id} msg={message_index}")
+            logger.debug(f"[Snip Tool Result]: tool={tool_info['name'] if tool_info else '?'} id={tool_id} msg={message_index} turn_number={state.current_turn_number}")
             state.messages[message_index]["content"][tool_call_index]["content"] = SNIP_PLACEHOLDER
 
         for file_path, indices in read_file_snip.items():
             for message_index, tool_call_index in indices[:-1]:
                 tool_id = state.messages[message_index]["content"][tool_call_index]["tool_use_id"]
-                logger.debug(f"[Snip Tool Result] duplicate-read snip: file={file_path} id={tool_id} msg={message_index}")
+                logger.debug(f"[Snip Tool Result] duplicate-read snip: file={file_path} id={tool_id} msg={message_index} turn_number={state.current_turn_number}")
                 state.messages[message_index]["content"][tool_call_index]["content"] = SNIP_READ_PLACEHOLDER
             last_msg_idx, last_tc_idx = indices[-1]
             last_turn = state.tool_id_to_turn.get(
@@ -66,7 +65,7 @@ class CompactionMixin:
             )
             if last_turn and last_turn["tool_call_turn"] + SNIP_READ_TURN <= state.current_turn_number:
                 tool_id = state.messages[last_msg_idx]["content"][last_tc_idx]["tool_use_id"]
-                logger.debug(f"[snip] age-based read snip: file={file_path} id={tool_id} msg={last_msg_idx}")
+                logger.debug(f"[snip] age-based read snip: file={file_path} id={tool_id} msg={last_msg_idx} turn_number={state.current_turn_number}")
                 state.messages[last_msg_idx]["content"][last_tc_idx]["content"] = SNIP_PLACEHOLDER
 
     def _microcompact_anthropic(self, state: AgentState) -> None:
@@ -109,20 +108,28 @@ class CompactionMixin:
         Returns 0 if no safe split exists (caller should compact everything).
         """
         if not messages:
+            logger.debug("[find_split_point] empty messages → 0")
             return 0
         keep_ratio = max(0.0, min(1.0, keep_ratio))
         total = self._estimate_tokens(messages)  # type: ignore[attr-defined]
         target = int(total * keep_ratio)
+        logger.debug(f"[find_split_point] total_msgs={len(messages)} est_tokens={total} target={target} (keep_ratio={keep_ratio})")
         running = 0
         raw = 0
         for i in range(len(messages) - 1, -1, -1):
             running += self._estimate_tokens([messages[i]])  # type: ignore[attr-defined]
             if running >= target:
                 raw = i
+                logger.debug(f"[find_split_point] raw split at i={i} running={running}>={target}")
                 break
+        else:
+            logger.debug(f"[find_split_point] never hit target ({running}<{target}), raw stays 0")
         adjusted = self._respect_tool_pairs(messages, raw)
+        logger.debug(f"[find_split_point] raw={raw} → adjusted={adjusted} (len={len(messages)})")
         if adjusted >= len(messages):
+            logger.debug("[find_split_point] adjusted >= len(messages) → returning 0 (compact everything)")
             return 0
+        logger.debug(f"[find_split_point] final split={adjusted}")
         return adjusted
 
     def _check_and_compact(self, state: AgentState, context_window: int) -> None:

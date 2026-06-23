@@ -347,7 +347,7 @@ class BaseAgent(CompactionMixin):
                             }
                         if tool_calls_result:
                             state.messages.append({"role":"user", "content":tool_calls_result})
-            self._check_and_compact(state,self.effective_context_window)
+                    self._check_and_compact(state,self.effective_context_window)
 
                 
     
