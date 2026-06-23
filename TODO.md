@@ -13,7 +13,22 @@
   - Use `asyncio` or `concurrent.futures.ThreadPoolExecutor`
   - Must handle permission checks and result collection safely
 
-- [ ] **Test GrepTool with all output modes**
+- [ ] **Parallel tool call execution**
+  - Execute independent tool calls concurrently within a single turn
+  - Use `asyncio` or `concurrent.futures` for parallel execution
+  - Ensure proper error handling and result collection
+
+- [ ] **Add memory session for conversation reload**
+  - Implement persistent session storage to reload conversations
+  - Store conversation history and state in memory/cache
+  - Allow users to resume previous sessions without loss of context
+
+- [ ] **Add checkpoint system**
+  - Create checkpoints at key points in the conversation
+  - Enable rollback to previous checkpoints if needed
+  - Track checkpoint history with timestamps
+
+- [ x ] **Test GrepTool with all output modes**
   - `output_mode: "content"` — test with context lines (-A/-B/-C), line numbers (-n), head_limit
   - `output_mode: "files_with_matches"` — test with head_limit
   - `output_mode: "count"` — test match counts per file
