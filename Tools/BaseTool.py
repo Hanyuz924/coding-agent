@@ -1,23 +1,22 @@
 """Base class for tool implementations using class-based architecture."""
-from abc import ABC, abstractmethod
-from typing import Any, Dict, Generic, Optional, TypeVar
-from dataclasses import dataclass, field
-from Tools.filestateCache import FileStateCache
-import logging
-import json
+# stdlib
+import asyncio
 import dataclasses
+import json
+import logging
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, Generic, Optional, TypeVar
+
+# local
+from Agent.types import AgentRunContext
+from Tools.filestateCache import FileStateCache
 
 
 #Top level tool call logger.
 #All the tool call use this logger.
 logger = logging.getLogger("myagent.tools")
 T = TypeVar("T")
-
-@dataclass
-class ToolUseContext:
-    filecachestate: FileStateCache
-    tooluse_id: str
-    max_tokens_read: int = 0
 
 
 @dataclass
@@ -48,7 +47,7 @@ class ToolResult(Generic[T]):
     def to_dict(self) -> Dict[str, Any]:
         return {
             "success": self.success,
-            "data":  dataclasses.asdict(self.data) if dataclasses.is_dataclass(self.data) else self.data,
+            "data":  dataclasses.asdict(self.data) if dataclasses.is_dataclass(self.data) else self.data, # type: ignore
             "error": self.error,
             "metadata": self.metadata,
         }
@@ -113,11 +112,11 @@ class BaseTool(ABC):
         return True
     
     @abstractmethod
-    def execute(self, context: ToolUseContext, **kwargs) -> ToolResult:
+    def execute(self, context: AgentRunContext, **kwargs) -> ToolResult:
         """Execute the tool with given parameters.
         
         Args:
-            context:  ToolUseContext providing FileStateCache, tooluse_id, and token limits
+            context:  AgentRunContext providing filecachestate, tooluse_id, and token limits
             **kwargs: Parameters matching the input_schema
             
         Returns:
@@ -125,7 +124,7 @@ class BaseTool(ABC):
         """
         pass
     
-    def __call__(self, context: ToolUseContext, **kwargs) -> ToolResult:
+    def __call__(self, context: AgentRunContext, **kwargs) -> ToolResult:
         """Allow tool instances to be called directly."""
         return self.execute(context, **kwargs)
 

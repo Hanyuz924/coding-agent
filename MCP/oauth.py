@@ -1,16 +1,21 @@
 from __future__ import annotations
 
+# stdlib
 import json
 import os
+import socket
 import threading
 import time
 import urllib.parse
 import webbrowser
 from pathlib import Path
 from typing import Optional
+
+# third-party
 import httpx
-import socket
 from authlib.integrations.httpx_client import OAuth2Client
+
+# local
 from MCP.callback_server import CallbackServer
 
 

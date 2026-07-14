@@ -1,10 +1,15 @@
+# stdlib
 import json
-import threading
-from MCP.mcp_types import MCPServerConfig, make_request, make_notification, MCPServerState,MCPTransport,INIT_PARAMS, MCPTool
-from MCP.oauth import OAuthSession
-import httpx
-from typing import Optional, Any, List, Dict
 import logging
+import threading
+from typing import Any, Dict, List, Optional
+
+# third-party
+import httpx
+
+# local
+from MCP.mcp_types import MCPServerConfig, make_request, make_notification, MCPServerState, MCPTransport, INIT_PARAMS, MCPTool
+from MCP.oauth import OAuthSession
 logger = logging.getLogger("myagent.MCP")
 
 

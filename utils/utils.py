@@ -1,6 +1,9 @@
-from typing import Any
+# stdlib
 import logging
 from pathlib import Path
+from typing import Any
+
+# third-party
 from rich.logging import RichHandler
 
 LOGGER_NAME = "myagent"
@@ -38,7 +41,7 @@ def add_file_handler(path: Path | str, level: int = logging.DEBUG) -> None:
     logger = logging.getLogger(LOGGER_NAME)
     handler = logging.FileHandler(path)
     handler.setLevel(level)
-    formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+    formatter = logging.Formatter("%(asctime)s - %(name)-30s - %(levelname)-5s - %(message)s")
     handler.setFormatter(formatter)
     logger.addHandler(handler)
 

@@ -1,17 +1,25 @@
 from __future__ import annotations
 
+# stdlib
+import asyncio
 import logging
-import time
-from typing import TYPE_CHECKING
-from Agent.compact_prompt import get_partial_compact_prompt, get_compact_user_summary_message
-from Model.anthropic_base import get_max_output_tokens
-
+from typing import TYPE_CHECKING, AsyncGenerator
+import anthropic
+# local
+from Agent.compact_prompt import get_compact_prompt, get_compact_user_summary_message, get_partial_compact_prompt
+from Agent.events import CompactResult
+from Agent.types import AgentDefinition, AgentRunContext, Message, SystemCompactMessage
+from ForkAgent.fork_agent import CacheSafeParams, ForkedAgentResult, build_cache_safe_params, run_fork_agent
+from Model.anthropic_base import (
+    AssistantTurn, TextChunk, ThinkingChunk,
+    calculate_cost, get_max_output_tokens, make_api_system_message, normalize_message_api,
+)
+from Tools.registry import get_read_only_tool_schemas
 if TYPE_CHECKING:
-    from Agent.agent import AgentState
+    from Agent.types import AgentState
 
 logger = logging.getLogger("myagent.agent")
 
-SNIP_THRESHOLD = 0.60
 MICROCOMPACT_IDLE_S = 5 * 60
 KEEP_RECENT_RESULTS = 3
 SNIP_PLACEHOLDER = "[Content snipped - re-read if needed]"
@@ -19,150 +27,198 @@ SNIP_READ_PLACEHOLDER = "[File content snipped - superseded by a more recent rea
 SNIP_TURN = 1
 SNIP_READ_TURN = 1
 AUTO_COMPACT_THRESHOLD = 0.9
-
-_COMPACT_THRESHOLD = 0.70
-_COMPACT_GRAY_ZONE = 0.85
+MAX_COMPACT_STREAMING_RETRIES = 2
 
 
-class CompactionMixin:
-    def _snip_tool_use_result(self, state: AgentState) -> None:
-        read_file_snip: dict = {}
-        other_tool_snip: list = []
-        for index, message in enumerate(state.messages):
-            if message.get("role") != "user" and not isinstance(message.get("content"), list):
-                continue
-            for tool_call_index, tool_call in enumerate(message["content"]):
-                if isinstance(tool_call, dict) and tool_call.get("type") == "tool_result" and isinstance(tool_call.get("content"), str) and tool_call["content"] != SNIP_PLACEHOLDER:
-                    tool_use_info = self._get_tool_info(state, tool_call["tool_use_id"])  # type: ignore[attr-defined]
-                    if not tool_use_info:
-                        logger.debug(f"[Snip Tool Result] No tool info found for tool id {tool_call['tool_use_id']}")
-                        continue
-                    if tool_use_info["name"] in ["Grep", "Glob", "Bash"]:
-                        tool_use_turn = state.tool_id_to_turn.get(tool_call["tool_use_id"])
-                        if not tool_use_turn:
-                            logger.debug(f"[Snip Tool Result] tool used turn for tool id {tool_call['tool_use_id']} not found")
-                            continue
-                        if tool_use_turn["tool_call_turn"] + SNIP_TURN <= state.current_turn_number:
-                            other_tool_snip.append((index, tool_call_index))
-                    elif tool_use_info["name"] == "Read":
-                        read_file_path = tool_use_info["input"].get("file_path")
-                        read_file_snip.setdefault(read_file_path, []).append((index, tool_call_index))
-
-        for message_index, tool_call_index in other_tool_snip:
-            tool_id = state.messages[message_index]["content"][tool_call_index]["tool_use_id"]
-            tool_info = self._get_tool_info(state, tool_id)  # type: ignore[attr-defined]
-            logger.debug(f"[Snip Tool Result]: tool={tool_info['name'] if tool_info else '?'} id={tool_id} msg={message_index} turn_number={state.current_turn_number}")
-            state.messages[message_index]["content"][tool_call_index]["content"] = SNIP_PLACEHOLDER
-
-        for file_path, indices in read_file_snip.items():
-            for message_index, tool_call_index in indices[:-1]:
-                tool_id = state.messages[message_index]["content"][tool_call_index]["tool_use_id"]
-                logger.debug(f"[Snip Tool Result] duplicate-read snip: file={file_path} id={tool_id} msg={message_index} turn_number={state.current_turn_number}")
-                state.messages[message_index]["content"][tool_call_index]["content"] = SNIP_READ_PLACEHOLDER
-            last_msg_idx, last_tc_idx = indices[-1]
-            last_turn = state.tool_id_to_turn.get(
-                state.messages[last_msg_idx]["content"][last_tc_idx]["tool_use_id"]
-            )
-            if last_turn and last_turn["tool_call_turn"] + SNIP_READ_TURN <= state.current_turn_number:
-                tool_id = state.messages[last_msg_idx]["content"][last_tc_idx]["tool_use_id"]
-                logger.debug(f"[snip] age-based read snip: file={file_path} id={tool_id} msg={last_msg_idx} turn_number={state.current_turn_number}")
-                state.messages[last_msg_idx]["content"][last_tc_idx]["content"] = SNIP_PLACEHOLDER
-
-    def _microcompact_anthropic(self, state: AgentState) -> None:
-        last_api_call_time = getattr(self, "last_api_call_time", None)  # type: ignore[attr-defined]
-        if not last_api_call_time or (time.time() - last_api_call_time) < MICROCOMPACT_IDLE_S:
-            return
-        all_results = []
-        for mi, msg in enumerate(state.messages):
-            if msg.get("role") != "user" or not isinstance(msg.get("content"), list):
-                continue
-            for bi, block in enumerate(msg["content"]):
-                if isinstance(block, dict) and block.get("type") == "tool_result" and isinstance(block.get("content"), str) and block["content"] not in (SNIP_PLACEHOLDER, "[Old result cleared]"):
-                    all_results.append((mi, bi))
-        clear_count = len(all_results) - KEEP_RECENT_RESULTS
-        if clear_count > 0:
-            logger.debug(f"[microcompact] idle={time.time() - last_api_call_time:.0f}s, clearing {clear_count}/{len(all_results)} results, keeping last {KEEP_RECENT_RESULTS}")
-        for i in range(max(0, clear_count)):
-            mi, bi = all_results[i]
-            logger.debug(f"[microcompact] clearing msg={mi} block={bi}")
-            state.messages[mi]["content"][bi]["content"] = "[Old result cleared]"
-
-    def _respect_tool_pairs(self, messages: list, raw: int) -> int:
-        """Advance raw forward until it lands on a plain user message (not tool_result)."""
-        for i in range(raw, len(messages)):
-            msg = messages[i]
-            if msg.get("role") != "user":
-                continue
-            content = msg.get("content", "")
-            if isinstance(content, str):
-                return i
-            if isinstance(content, list) and not any(
-                isinstance(b, dict) and b.get("type") == "tool_result" for b in content
-            ):
-                return i
-        return len(messages)
-
-    def find_split_point(self, messages: list, keep_ratio: float = 0.3) -> int:
-        """Find index splitting messages so ~keep_ratio of tokens are in the recent portion.
-
-        Returns 0 if no safe split exists (caller should compact everything).
-        """
-        if not messages:
-            logger.debug("[find_split_point] empty messages → 0")
-            return 0
-        keep_ratio = max(0.0, min(1.0, keep_ratio))
-        total = self._estimate_tokens(messages)  # type: ignore[attr-defined]
-        target = int(total * keep_ratio)
-        logger.debug(f"[find_split_point] total_msgs={len(messages)} est_tokens={total} target={target} (keep_ratio={keep_ratio})")
-        running = 0
-        raw = 0
-        for i in range(len(messages) - 1, -1, -1):
-            running += self._estimate_tokens([messages[i]])  # type: ignore[attr-defined]
-            if running >= target:
-                raw = i
-                logger.debug(f"[find_split_point] raw split at i={i} running={running}>={target}")
-                break
+def estimate_tokens(messages: list[Message]) -> int:
+    total_chars = 0
+    message_count = 0
+    for message in messages:
+        message_count += 1
+        content = message.content
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict):
+                    for v in block.values():
+                        if isinstance(v, str):
+                            total_chars += len(v)
         else:
-            logger.debug(f"[find_split_point] never hit target ({running}<{target}), raw stays 0")
-        adjusted = self._respect_tool_pairs(messages, raw)
-        logger.debug(f"[find_split_point] raw={raw} → adjusted={adjusted} (len={len(messages)})")
-        if adjusted >= len(messages):
-            logger.debug("[find_split_point] adjusted >= len(messages) → returning 0 (compact everything)")
-            return 0
-        logger.debug(f"[find_split_point] final split={adjusted}")
-        return adjusted
+            total_chars += len(content)
+    content_tokens = int(total_chars / 2.8)
+    framing_tokens = message_count * 4
+    return int((content_tokens + framing_tokens) * 1.1)
 
-    def _check_and_compact(self, state: AgentState, context_window: int) -> None:
-        if state.total_input_tokens > context_window * AUTO_COMPACT_THRESHOLD:
-            logger.info(f"[compact] context at {state.total_input_tokens}/{context_window} tokens, triggering auto_compact")
-            self.auto_compact(state)
 
-    def auto_compact(self, state: AgentState) -> None:
-        split = self.find_split_point(state.messages)
-        old = state.messages[:split] if split > 0 else state.messages
-        kept = state.messages[split:] if split > 0 else []
-        
+async def check_and_compact(
+    agent_def: AgentDefinition,
+    state: AgentState,
+    ctx: AgentRunContext,
+) -> AsyncGenerator[CompactResult, None]:
+    if ctx.disable_compact:
+        return
+    if state.context_tokens > agent_def.context_window * AUTO_COMPACT_THRESHOLD:
+        logger.info(f"[compact] context at {state.context_tokens}/{agent_def.context_window} tokens, triggering compact")
+        if ctx.rendered_system_prompt:
+            async for event in compact_conversation(agent_state=state, agent_def=agent_def, ctx=ctx):
+                if isinstance(event, CompactResult):
+                    if event.success:
+                        state.context_tokens = estimate_tokens(get_messages_after_compact_boundary(state.messages))
+                    else:
+                        logger.error(f"[compact] compaction failed via path={event.path!r}, conversation context may be stale")
+                        raise RuntimeError(f"Compaction failed (path={event.path!r})")
+                yield event
 
-        model = self.model  # type: ignore[attr-defined]
-        summary_resp = model.client.messages.create(
-            model=model.model_name,
-            max_tokens=get_max_output_tokens(model= model.model_name),
-            system=get_partial_compact_prompt(direction="up_to"),
-            messages=[
-                *old,
-                {"role": "user", "content": "Please provide your summary now."},
-            ],
-        )
-        summary_text = summary_resp.content[0].text if summary_resp.content and summary_resp.content[0].type == "text" else "No summary available."
-        logger.info(f"[compact] split={split}, compacted {len(old)} msgs, kept {len(kept)}")
-        print("\n[Auto Compaction Summary]\n" + summary_text + "\n")
-        summary_user_content = get_compact_user_summary_message(
-            summary_text,
-            recent_messages_preserved=bool(kept),
-        )
-        state.messages = [
-            {"role": "user", "content": summary_user_content},
-            {"role": "assistant", "content": "Understood. I have the context from our previous conversation. How can I continue helping?"},
-            *kept,
-        ]
-        state.total_input_tokens = 0
+def _extract_summary_text(messages: list[Message]) -> str:
+    """Pull the plain summary text out of the fork's assistant output message(s).
+
+    The fork returns its last assistant message, whose content is a list of
+    content blocks (or a bare string). We only want the text — it then gets
+    re-wrapped as a framed *user* message (CC parity: the summary re-enters the
+    conversation as user-provided context, not as the model's own turn).
+    """
+    parts: list[str] = []
+    for msg in messages:
+        content = msg.content
+        if isinstance(content, str):
+            parts.append(content)
+            continue
+        for block in content or []:
+            if isinstance(block, dict) and block.get("type") == "text":
+                parts.append(block.get("text", ""))
+            elif isinstance(block, str):
+                parts.append(block)
+    return "\n".join(p for p in parts if p).strip()
+
+
+async def compact_conversation(
+    agent_state: AgentState,
+    agent_def: AgentDefinition,
+    ctx: AgentRunContext,
+    customInstructions: str | None = None,
+) -> AsyncGenerator[CompactResult | TextChunk | ThinkingChunk, None]:
+    compact_prompt = get_compact_prompt(customInstructions)
+    compact_message = Message(role="user", content=compact_prompt)
+    #decide which part of the message need to be compact 
+    message_to_compact = get_messages_after_compact_boundary(agent_state.messages)
+    pre_compact_token = estimate_tokens(message_to_compact)
+    cachesafeparams = build_cache_safe_params(
+        model=ctx.options.model,
+        system_prompt=ctx.rendered_system_prompt,  # type: ignore
+        tools=ctx.options.tools,
+        fork_context_messages=message_to_compact,
+    )
+    compactresult = CompactResult(success=False)
+    try:
+        async for event in run_fork_agent(
+            parent_ctx=ctx,
+            agent_def=agent_def,
+            cachesafeparams=cachesafeparams,
+            user_message=compact_message,
+            agent_type="forked-sub-agent",
+            disable_compact=True,
+        ):
+            if isinstance(event, ForkedAgentResult):
+                if event.message:
+                    cost = calculate_cost(ctx.options.model, event.usage)
+                    agent_state.usage.accumulate(event.usage)
+                    agent_state.current_cost += cost
+                    logger.info(
+                        f"[compact] summary usage: in={event.usage.input_tokens} "
+                        f"out={event.usage.output_tokens} "
+                        f"cache_read={event.usage.cache_read_input_tokens} "
+                        f"cache_create={event.usage.cache_creation_input_tokens} "
+                        f"cost=${cost:.6f}"
+                    )
+                    compactresult.success = True
+                    compactresult.path = "fork"
+                    compactresult.cache_read_tokens = event.usage.cache_read_input_tokens
+                    compactresult.cache_creation_tokens = event.usage.cache_creation_input_tokens
+                    #update the agent message here
+                    compact_boundary_marker = create_compact_boundary_message(pre_compact_token=pre_compact_token)
+                    # Re-wrap the model-produced summary as a framed USER message
+                    # (CC parity), not the fork's raw assistant message.
+                    summary_text = _extract_summary_text(event.message)
+                    summary_message = Message(
+                        role="user",
+                        content=get_compact_user_summary_message(summary_text),
+                    )
+                    agent_state.messages.append(compact_boundary_marker)
+                    agent_state.messages.append(summary_message)
+            else:
+                yield event
+    except Exception:
+        logger.exception("[compact] fork agent failed, falling back to direct streaming")
+
+    if compactresult.success:
+        agent_state.context_tokens = estimate_tokens(get_messages_after_compact_boundary(agent_state.messages))
+        yield compactresult
+        return
+
+    # Fallback: direct streaming without cache sharing
+    logger.info("[compact] falling back to direct streaming for compaction")
+    sys_message = Message(role="system", content="You are a helpful AI assistant tasked with summarizing conversations.")
+    api_sys_message = make_api_system_message([sys_message], api_cache_enable=False)
+    api_messages = normalize_message_api(message_to_compact)
+    api_messages.append({"role": "user", "content": compact_prompt})
+
+    assistant_turn = None
+    for attempt in range(MAX_COMPACT_STREAMING_RETRIES):
+
+        assistant_turn = None
+        try:
+            async for stream in agent_def.model.stream_anthropic(
+                system_message=api_sys_message,
+                tool_use_schemas=get_read_only_tool_schemas(),
+                messages=api_messages,
+            ):
+                if isinstance(stream, (TextChunk, ThinkingChunk)):
+                    yield stream
+                elif isinstance(stream, AssistantTurn):
+                    assistant_turn = stream
+            if assistant_turn is not None:
+                break
+        except (anthropic.RateLimitError, anthropic.APIConnectionError, anthropic.APITimeoutError) as e:
+            wait = 2 ** (attempt + 1)
+            logger.warning(f"{type(e).__name__}, retrying in {wait}s (attempt {attempt + 1}/{MAX_COMPACT_STREAMING_RETRIES})")
+            await asyncio.sleep(wait)
+        except Exception as e:
+            logger.error(f"Unexpected error during API call: {type(e).__name__}: {e}")
+    if not assistant_turn:
+        logger.warning("[compact] fallback produced no summary text, skipping state update")
+        yield CompactResult(success=False, path="fallback")
+        return
+    cost = calculate_cost(ctx.options.model, assistant_turn.usage)
+    agent_state.usage.accumulate(assistant_turn.usage)
+    agent_state.current_cost += cost
+    compact_boundary_marker = create_compact_boundary_message(pre_compact_token=pre_compact_token)
+    # Same as the fork path: the summary re-enters as a framed USER message.
+    summary_message = Message(
+        role="user",
+        content=get_compact_user_summary_message(assistant_turn.text),
+    )
+    agent_state.messages.extend([compact_boundary_marker, summary_message])
+
+    yield CompactResult(success=True, path="fallback")
+
+
+
+def create_compact_boundary_message(pre_compact_token:int, trigger:str =" auto", ) -> SystemCompactMessage:
+    return SystemCompactMessage(compact_metadata={
+        "trigger":trigger,
+        "pre_compact_tokens":pre_compact_token,
+    })
+
+def get_messages_after_compact_boundary(messages:list[Message]) -> list[Message]:
+    boundaryIndex = find_last_compact_boundary_index(messages)
+    if boundaryIndex == -1:
+        return messages
+    return messages[boundaryIndex + 1:]
+
+def find_last_compact_boundary_index(messages:list[Message]) -> int:
+    if not messages:
+        return -1
+    for i in range(len(messages) -1, -1, -1):
+        if isinstance(messages[i],SystemCompactMessage) :
+            return i
+    return -1
+

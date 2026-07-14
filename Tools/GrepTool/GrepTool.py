@@ -1,13 +1,17 @@
-from dataclasses import dataclass
-from typing import Any, Dict, Optional, Literal
-from pydantic import BaseModel, Field
+# stdlib
 import os
-from Tools.BaseTool import BaseTool, ToolResult, logger, ToolUseContext
 import subprocess
-from Tools.GrepTool.Grep_prompt import get_description
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Dict, Literal, Optional
+
+# third-party
+from pydantic import BaseModel, Field
+
+# local
+from Tools.BaseTool import BaseTool, ToolResult, AgentRunContext, logger
+from Tools.GrepTool.Grep_prompt import get_description
 from Tools.tool_utils import expandPath
-import logging
 
 DEFAULT_HEAD_LIMIT = 250
 DEFAULT_TIMEOUT_MS = 120_000
@@ -142,8 +146,12 @@ class GrepTool(BaseTool):
     }
     @property
     def read_only(self) -> bool:
-        return False
+        return True
     
+    @property
+    def concurrent_safe(self) -> bool:
+        return True
+
     def apply_head_limit(self, search_result:list, limit: Optional[int], offset :int= 0):
         if limit == 0:
             return search_result[offset:]
@@ -167,7 +175,7 @@ class GrepTool(BaseTool):
         logger.debug(f"[{self.name}] : glob flag search pattern after split {patterns}")
         return patterns
     
-    def execute(self, ctx:ToolUseContext, cwd: Optional[str] = None, **kwargs) -> ToolResult:
+    def execute(self, ctx: AgentRunContext, cwd: Optional[str] = None, **kwargs) -> ToolResult:
         cwd = cwd or os.getcwd()
         #default path should set to cwd
         if not kwargs.get("path", None):

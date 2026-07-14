@@ -1,13 +1,18 @@
+# stdlib
+import os
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Union
+
+# third-party
 from pydantic import BaseModel, Field
-import os
-from Tools.BaseTool import BaseTool, ToolResult, ToolUseContext,logger
-from Tools.filestateCache import FileState
-from datetime import datetime
+
+# local
 import Tools.tool_utils as utils
-from dataclasses import dataclass
+from Tools.BaseTool import BaseTool, ToolResult, AgentRunContext, logger
 from Tools.WriteTool.write_prompt import get_write_tool_description
+from Tools.filestateCache import FileState
 
 @dataclass
 class FileWriteOutput:
@@ -44,6 +49,10 @@ class WriteTool(BaseTool):
         return get_write_tool_description()
     
     @property
+    def concurrent_safe(self) -> bool:
+        return False
+    
+    @property
     def get_pre_read_instruction(self) -> str:
         """Return the pre read instruction to llm"""
         return "If this is an existing file, you MUST use the Read tool first to read the file's contents. This tool will fail if you did not read the file first."
@@ -68,7 +77,7 @@ class WriteTool(BaseTool):
     
     def execute(
         self,
-        toolusecontext:ToolUseContext,
+        ctx: AgentRunContext,
         **kwargs
     ) -> ToolResult:
         input = FileWriteInput(**kwargs)
@@ -94,14 +103,14 @@ class WriteTool(BaseTool):
                 )
             
             # Cache check for existing files
-            if not toolusecontext.filecachestate.has(fullpath_str):
+            if not ctx.filecachestate.has(fullpath_str):
                 return ToolResult(
                     success=False,
                     error="File has not been read yet. Read it first before writing to it."
                 )
             
             # Check if file was modified since read
-            file_cache_state = toolusecontext.filecachestate.get_file_state(fullpath_str)
+            file_cache_state = ctx.filecachestate.get_file_state(fullpath_str)
             latest_mtime = int(os.path.getmtime(fullpath))
             if latest_mtime > file_cache_state.modify_timestamp: # type: ignore
                 return ToolResult(
@@ -132,7 +141,7 @@ class WriteTool(BaseTool):
                 read_timestamp=int(datetime.now().timestamp()),
                 modify_timestamp=new_mtime,
             )
-            toolusecontext.filecachestate.set(fullpath_str, new_file_state)
+            ctx.filecachestate.set(fullpath_str, new_file_state)
             
             return ToolResult(
                 success=True,

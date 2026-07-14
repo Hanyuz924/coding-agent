@@ -1,10 +1,15 @@
-from dataclasses import dataclass
-from typing import Any, Dict
-from pydantic import BaseModel, Field
+# stdlib
 import os
-from Tools.BaseTool import BaseTool, ToolResult, logger, ToolUseContext
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Dict
+
+# third-party
+from pydantic import BaseModel, Field
+
+# local
+from Tools.BaseTool import BaseTool, ToolResult, AgentRunContext, logger
 from Tools.tool_utils import expandPath
 
 GLOB_TOOL_NAME = 'Glob'
@@ -65,6 +70,10 @@ class GlobTool(BaseTool):
     def read_only(self) -> bool:
         return True
     
+    @property
+    def concurrent_safe(self) -> bool:
+        return True
+    
 
     """
     Extracts the static base directory from a glob pattern.
@@ -90,7 +99,7 @@ class GlobTool(BaseTool):
 
         return base_dir, relative_pattern
     
-    def execute(self, ctx:ToolUseContext, **kwargs) -> ToolResult:
+    def execute(self, ctx: AgentRunContext, **kwargs) -> ToolResult:
         input = GlobToolInput(**kwargs)
         search_dir = input.path
         search_pattern = input.pattern

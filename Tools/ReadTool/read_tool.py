@@ -1,14 +1,19 @@
 """Read tool implementation using class-based architecture."""
+# stdlib
+import os
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
+
+# third-party
 from pydantic import BaseModel, Field
-import os
-from Tools.BaseTool import BaseTool, ToolResult, ToolUseContext, logger
-from Tools.filestateCache import FileState
-from datetime import datetime
-from Tools.tool_utils import expandPath
-from dataclasses import dataclass
+
+# local
+from Tools.BaseTool import BaseTool, ToolResult, AgentRunContext, logger
 from Tools.ReadTool.Read_prompt import render_prompt_template, FILE_READ_TOOL_NAME
+from Tools.filestateCache import FileState
+from Tools.tool_utils import expandPath
 
 
 
@@ -126,7 +131,7 @@ class ReadTool(BaseTool):
 
     def execute(
         self,
-        toolusecontext: ToolUseContext,
+        ctx: AgentRunContext,
         **kwargs
     ) -> ToolResult:
         """Execute the read tool with cache support.
@@ -180,8 +185,8 @@ class ReadTool(BaseTool):
         
         # Step 2: Check cache with mtime validation
         logger.debug(f"[read] {fullpath_str} offset={valid_offset} limit={valid_limit}")
-        if toolusecontext.filecachestate.is_valid(fullpath_str):
-            file_states = toolusecontext.filecachestate.get_file_state(fullpath_str)
+        if ctx.filecachestate.is_valid(fullpath_str):
+            file_states = ctx.filecachestate.get_file_state(fullpath_str)
             cached_content = file_states.content.splitlines(keepends=True)  # type: ignore
             
             # Cache always contains the whole file, extract requested chunk
@@ -230,7 +235,7 @@ class ReadTool(BaseTool):
                 read_timestamp=int(datetime.now().timestamp()),
                 modify_timestamp=int(os.path.getmtime(fullpath_str)),
             )
-            toolusecontext.filecachestate.set(fullpath_str, new_file_state)
+            ctx.filecachestate.set(fullpath_str, new_file_state)
             output = "".join(
                 f"{start + i + 1}\t{l}" for i, l in enumerate(chunk)
             )

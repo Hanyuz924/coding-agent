@@ -1,36 +1,31 @@
 # coding-agent TODO
 
-## Pending
+## 2026-07-07
 
-- [ x ] **Fix `prepare_anthropic_message()` performance**
-  - Currently re-processes the entire message list on every API call
-  - Option: incremental conversion — cache prepared list + track `_prepared_until` index in `AgentState`
-  - Option: store messages in Anthropic wire format directly, eliminating conversion entirely
+- [ ] **Microcompact: study CC's `cachedMicrocompactPath` implementation**
+  - CC has a cache-aware microcompact path that avoids breaking the prompt cache when clearing old tool results
+  - Learn how `cachedMicrocompactPath` works and apply the same approach here
 
-- [ ] **Concurrent tool call execution**
-  - Currently tool calls in a single turn run sequentially
-  - Refactor the tool dispatch loop in `queryLoop` to run independent tool calls concurrently
-  - Use `asyncio` or `concurrent.futures.ThreadPoolExecutor`
-  - Must handle permission checks and result collection safely
+- [ ] **Snip strategy: deliberate design required**
+  - Snipping frees context window space but may cause cache misses on the next API call
+  - Anthropic prompt cache is keyed on the exact message prefix — any snipped content breaks the cache hit
+  - Trade-off: context savings vs. cache miss cost (cache miss = full input token cost instead of 0.1x)
+  - Need to decide: only snip when context pressure is high enough that the savings outweigh the cache miss penalty, or snip lazily after a compact boundary (cache is already broken at that point anyway)
 
-- [ ] **Parallel tool call execution**
-  - Execute independent tool calls concurrently within a single turn
-  - Use `asyncio` or `concurrent.futures` for parallel execution
-  - Ensure proper error handling and result collection
 
-- [ ] **Add memory session for conversation reload**
-  - Implement persistent session storage to reload conversations
-  - Store conversation history and state in memory/cache
-  - Allow users to resume previous sessions without loss of context
+- [ ] **Implement memory / session persistence**
+  - Persist `AgentState` (messages, usage, context_tokens) to disk at end of session
+  - Reload and resume a previous session by session ID
+  - Store compact boundary markers so resumed sessions know where history ends and model-visible context begins
+
+- [√] **Decide position of auto compaction trigger**
+  - Currently triggered after tool results are appended to messages
+  - Evaluate whether compaction should also be checked before each LLM API call
+  - Ensure split point always preserves at least the last plain user message
+  - inside the while loop or out side the while loop
 
 - [ ] **Add checkpoint system**
   - Create checkpoints at key points in the conversation
   - Enable rollback to previous checkpoints if needed
   - Track checkpoint history with timestamps
 
-- [ x ] **Test GrepTool with all output modes**
-  - `output_mode: "content"` — test with context lines (-A/-B/-C), line numbers (-n), head_limit
-  - `output_mode: "files_with_matches"` — test with head_limit
-  - `output_mode: "count"` — test match counts per file
-  - Test case-insensitive flag (-i)
-  - Test with glob pattern and type filter

@@ -1,15 +1,31 @@
+from __future__ import annotations
+
+# stdlib
 import json
-import time
 import logging
+import time
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, AsyncGenerator, Literal, Optional, cast
+
+# third-party
 import anthropic
-from typing import Generator, cast
-from anthropic.types import ToolParam
-from pydantic import BaseModel, Field
+from anthropic.types import MessageParam, ToolParam
+
+# local
+from Model.types import Usage
+if TYPE_CHECKING:
+    from Agent.types import Message
 
 logger = logging.getLogger("myagent.model")
 
+@dataclass
+class ThinkingConfig:
+    type: Literal["adaptive", "enabled", "disabled"]
+    budget_tokens: int = 8000
+
+
 # Pricing per million tokens (input, output)
-_MODEL_PRICING: dict[str, tuple[float, float]] = {
+_MODEL_PRICING: dict[str, tuple[float, float]] = {  # (input $/M, output $/M)
     "claude-opus-4-6":   (5.00, 25.00),
     "claude-sonnet-4-6": (3.00, 15.00),
     "claude-haiku-4-5":  (1.00,  5.00),
@@ -35,8 +51,60 @@ def get_max_output_tokens(model:str) -> int:
     # return MODEL_MAX_OUTPUT.get(model, 16_000)
 
 def get_context_window(model: str) -> int:
-    return 25_000 #test purpose
-    # return MODEL_CONTEXT.get(model, 200000)
+    return 50000
+    #return MODEL_CONTEXT.get(model, 200000)
+
+def calculate_cost(model_name: str, usage: Usage) -> float:
+    pricing = _MODEL_PRICING.get(model_name)
+    if not pricing:
+        return 0.0
+    input_price, output_price = pricing
+    return usage.cost(input_price, output_price)
+
+
+
+def normalize_message_api(message_list: list[Message], api_cache_enable: bool = True) -> list[dict]:
+    ret = []
+    for m in message_list:
+        # Build content from message.content and message.tool_calls
+        content = list(m.content) if isinstance(m.content, list) else (
+            [{"type": "text", "text": m.content}] if m.content else []
+        )
+        # Append tool_calls from the dedicated field
+        for tc in m.tool_calls:
+            content.append({
+                "type": "tool_use",
+                "id": tc["id"],
+                "name": tc["name"],
+                "input": tc["input"],
+            })
+        ret.append({"role": m.role, "content": content})
+
+    if api_cache_enable and ret:
+        last = ret[-1]
+        blocks = last["content"]
+        if blocks:  # only add cache_control if there are content blocks
+            blocks[-1] = {**blocks[-1], "cache_control": {"type": "ephemeral"}}
+            last["content"] = blocks
+
+    return ret
+
+
+def make_api_system_message(system_messages: list[Message], api_cache_enable: bool = True) -> list:
+    if api_cache_enable:
+        return [{"type": "text", "text": m.content, "cache_control": {"type": "ephemeral"}} for m in system_messages]
+    else:
+        return [{"type": "text", "text": m.content} for m in system_messages]
+
+def make_api_tool_message(tool_use_schema: list[dict], api_cache_enable: bool = True) -> list[dict]:
+    if not api_cache_enable or not tool_use_schema:
+        return tool_use_schema.copy()       
+    tools = tool_use_schema.copy()
+    tools[-1] = {**tools[-1], "cache_control": {"type": "ephemeral"}}
+    return tools
+
+@dataclass
+
 
 class TextChunk:
     def __init__(self, text): self.text = text
@@ -52,7 +120,7 @@ class AssistantTurn:
         self.in_tokens   = in_tokens
         self.out_tokens  = out_tokens
         self.stop_reason = stop_reason
-        self.usage = usage
+        self.usage       = Usage.from_anthropic(usage)
 class FinishChunk:
     def __init__(self, text):
         self.text = text
@@ -64,17 +132,15 @@ class UsageChunk:
 class AnthropicModelClass:
     def __init__(self, model_name: str, api_key: str | None = None) -> None:
         self.model_name = model_name
-        self.client = anthropic.Anthropic(api_key=api_key)
+        self.client = anthropic.AsyncAnthropic(api_key=api_key)
         logger.info(f"AnthropicModelClass initialized with model: {model_name}")
 
     # ------------------------------------------------------------------ #
-    # Streaming                                                            #
+    # Streaming                                                          #
     # ------------------------------------------------------------------ #
 
-
-
-    def _make_cached_system(self, system_message:str) -> list:
-        return [{"type":"text", "text": system_message, "cache_control":{"type":"ephemeral"}}]
+    def _make_cached_system(self, system_messages: list[Message]) -> list:
+        return [{"type": "text", "text": m.content, "cache_control": {"type": "ephemeral"}} for m in system_messages]
 
     def _make_cached_tool_schema(self, tool_use_schema: list[dict]) -> list[dict]:
         tools = tool_use_schema.copy()
@@ -137,13 +203,71 @@ class AnthropicModelClass:
                 index += 1
 
         return result 
+    
+    async def side_query(
+        self,
+        messages: list[dict[str, Any]],
+        system: str | list[dict[str, Any]] | None = None,
+        tools: Optional[list[dict[str, Any]]] = None,
+        # json_schema dict for structured output, e.g.
+        #   {"type": "json_schema", "schema": {...}}
+        output_format: Optional[dict[str, Any]] = None,
+        max_tokens: int = 1024,
+        max_retries: int = 2,
+        thinking:bool =False,
+        stop_sequences: Optional[list[str]] = None,
+        query_source: str = "side_query",
+    ) -> Any:
+        """Make a single non-agentic API call and return the raw response message."""
 
-    def stream_anthropic(
-            self, 
-            system_message:str,
-            tool_use_schemas:list,
+        system_blocks: list[dict[str, Any]] = []
+        if isinstance(system, list):
+            system_blocks.extend(system)
+        elif system:
+            system_blocks.append({"type": "text", "text": system})
+
+        # ── assemble optional params ──────────────────────────────────────────────
+        params: dict[str, Any] = {
+            "model": self.model_name,
+            "max_tokens": max_tokens,
+            "messages": messages,
+        }
+        if system_blocks:
+            params["system"] = system_blocks
+        if tools:
+            params["tools"] = tools
+        if output_format:
+            params["output_config"] = {"format": output_format}
+        if stop_sequences:
+            params["stop_sequences"] = stop_sequences
+
+        if thinking is True:
+            params["thinking"] = {"type": "adaptive"}
+        else:
+            params["thinking"] = {"type": "disabled"}
+
+        response = await self.client.with_options(max_retries=max_retries).messages.create(**params)
+
+        u = response.usage
+        logger.info(
+            "[%s] model=%s in=%d out=%d cache_read=%d cache_create=%d",
+            query_source,
+            self.model_name,
+            u.input_tokens,
+            u.output_tokens,
+            u.cache_read_input_tokens or 0,
+            u.cache_creation_input_tokens or 0,
+        )
+        return response
+
+        
+
+    async def stream_anthropic(
+            self,
+            system_message:list[str],
+            tool_use_schemas:list[dict],
             messages: list,
-        ) -> Generator:
+        ) -> AsyncGenerator:
         """
         Stream the LLM response, yielding typed chunk dicts:
 
@@ -163,20 +287,35 @@ class AnthropicModelClass:
         try:
             #TODO get from config and set a default value 
             max_tokens = 32000
+            sys_has_cache = any(
+                isinstance(s, dict) and "cache_control" in s
+                for s in (system_message or [])
+            )
+            tools_has_cache = any(
+                isinstance(t, dict) and "cache_control" in t
+                for t in (tool_use_schemas or [])
+            )
+            logger.debug(
+                f"[stream_anthropic] sys_cache={sys_has_cache} "
+                f"tools_cache={tools_has_cache} "
+                f"sys_len={len(system_message or [])} "
+                f"tools_len={len(tool_use_schemas or [])} "
+                f"msgs_len={len(messages or [])}"
+            )
             kwargs = {
                 "model": self.model_name,
                 "max_tokens":max_tokens,
-                "system":self._make_cached_system(system_message),
+                "system":system_message,
                 "messages": messages,
-                "tools":self._make_cached_tool_schema(tool_use_schemas)                   
+                "tools":tool_use_schemas
             }
             text = ""
             
             tool_calls = []
-            with self.client.messages.stream(
+            async with self.client.messages.stream(
                 **kwargs,
             ) as stream:
-                for event in stream:
+                async for event in stream:
                     if event.type == "content_block_delta":
                         delta = event.delta
                         if delta.type == "text_delta":
@@ -185,7 +324,7 @@ class AnthropicModelClass:
                         elif delta.type == "thinking_delta":
                             yield ThinkingChunk(delta.thinking)
                 # Usage is complete only after the stream closes
-                final = stream.get_final_message()
+                final = await stream.get_final_message()
 
                 for block in final.content:
                     if block.type == "tool_use":
@@ -209,41 +348,38 @@ class AnthropicModelClass:
             logger.error(f"Authentication error: {e}")
             raise
 
-    def count_tokens_api(
-        self,      
-        system_message:str,
-        tool_use_schemas:list,
-        messages: list,
+    async def count_tokens_api(
+        self,
+        system_messages: list[Message],
+        tool_use_schemas: list,
+        messages: list[Message],
     ) -> int:
-        response = self.client.messages.count_tokens(
+        response = await self.client.messages.count_tokens(
             model=self.model_name,
-            system=self._make_cached_system(system_message),
-            messages=messages,
+            system=self._make_cached_system(system_messages),
+            messages=cast(list[MessageParam], normalize_message_api(messages)),
             tools=cast(list[ToolParam], self._make_cached_tool_schema(tool_use_schemas)),
         )
         return response.input_tokens
 
-    def collect_stream(
-            self, 
-            system_message:str,
-            tool_use_schemas:list,
+    async def collect_stream(
+            self,
+            system_messages: list[Message],
+            tool_use_schemas: list,
             messages: list,
         ) -> anthropic.types.Message:
         """
         Call the API with streaming and return the complete Message object.
-        Use this when you need the full response for parse_actions / parse_response
-        without consuming streaming chunks manually.
         """
-
         max_tokens = 16000
-        with self.client.messages.stream(
+        async with self.client.messages.stream(
             model=self.model_name,
-            system=system_message,
+            system=self._make_cached_system(system_messages),
             messages=messages,
             tools=tool_use_schemas,
             max_tokens=max_tokens,
         ) as stream:
-            final = stream.get_final_message()
+            final = await stream.get_final_message()
         logger.info(
             f"collect_stream complete: stop_reason={final.stop_reason}, "
             f"usage={final.usage}"
@@ -292,7 +428,7 @@ class AnthropicModelClass:
             # chat_history (not the text-only "content" string).
             "raw_content": llm_response.content,
             "tool_calls": tool_calls,
-            "cost": self._calculate_cost(llm_response),
+            "cost": calculate_cost(self.model_name, Usage.from_anthropic(llm_response.usage)),
             "timestamp": time.time(),
         }
 
@@ -301,17 +437,3 @@ class AnthropicModelClass:
     # Cost                                                                 #
     # ------------------------------------------------------------------ #
 
-    def _calculate_cost(self, response: anthropic.types.Message) -> float:
-        pricing = _MODEL_PRICING.get(self.model_name)
-        if not pricing:
-            return 0.0
-        input_price, output_price = pricing
-        usage = response.usage
-        cache_read = getattr(usage, "cache_read_input_tokens", 0) or 0
-        cache_creation = getattr(usage, "cache_creation_input_tokens", 0) or 0
-        return (
-            usage.input_tokens * input_price / 1_000_000
-            + usage.output_tokens * output_price / 1_000_000
-            + cache_read * input_price * 0.1 / 1_000_000
-            + cache_creation * input_price * 1.25 / 1_000_000
-        )

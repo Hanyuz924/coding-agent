@@ -1,6 +1,6 @@
 from typing import Any, Dict
 
-from Tools.BaseTool import BaseTool, ToolResult, ToolUseContext, logger
+from Tools.BaseTool import BaseTool, ToolResult, AgentRunContext, logger
 from enter_plan_tool_prompt import ENTER_PLAN_MODE_TOOL_NAME, get_enter_plan_mode_tool_prompt
 
 

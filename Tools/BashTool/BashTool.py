@@ -1,9 +1,14 @@
-import shutil
-from typing import Any, Dict, Optional
-from pydantic import BaseModel, Field
+# stdlib
 import os
-from Tools.BaseTool import BaseTool, ToolResult, logger, ToolUseContext
+import shutil
 import subprocess
+from typing import Any, Dict, Optional
+
+# third-party
+from pydantic import BaseModel, Field
+
+# local
+from Tools.BaseTool import BaseTool, ToolResult, AgentRunContext, logger
 from Tools.BashTool.bash_prompt import DEFAULT_TIMEOUT_MS
 
 
@@ -87,12 +92,15 @@ class BashTool(BaseTool):
     @property
     def read_only(self) -> bool:
         return False
-    
+    @property
+    def concurrent_safe(self) -> bool:
+        return False
+
     def _get_shell_path(self) -> str:
         shell = os.environ.get("SHELL") or shutil.which("bash") or "/bin/sh"
         return shell
 
-    def execute(self, ctx:ToolUseContext, **kwargs) -> ToolResult:
+    def execute(self, ctx: AgentRunContext, **kwargs) -> ToolResult:
         input = BashToolInput(**kwargs)
         shell_path = self._get_shell_path()
         logger.debug(f"[{self.name}] command={input.command!r}, shell={shell_path}, timeout={input.timeout}ms")

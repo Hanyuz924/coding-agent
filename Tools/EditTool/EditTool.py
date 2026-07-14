@@ -1,13 +1,18 @@
+# stdlib
+import os
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Union
+
+# third-party
 from pydantic import BaseModel, Field
-import os
-from Tools.BaseTool import BaseTool, ToolResult, ToolUseContext,logger
-from Tools.filestateCache import FileState
-from datetime import datetime
+
+# local
 import Tools.tool_utils as utils
-from dataclasses import dataclass
+from Tools.BaseTool import BaseTool, ToolResult, AgentRunContext, logger
 from Tools.EditTool.Edit_prompt import get_edit_tool_description
+from Tools.filestateCache import FileState
 
 
 class FileEditInput(BaseModel):
@@ -46,6 +51,10 @@ class EditTool(BaseTool):
         return get_edit_tool_description()
     
     @property
+    def concurrent_safe(self) -> bool:
+        return False
+    
+    @property
     def input_schema(self) -> Dict[str, Any]:
         return {
             "type":"object",
@@ -70,7 +79,7 @@ class EditTool(BaseTool):
             "required":["file_path", "old_string", "new_string"]
         }
 
-    def execute(self,toolusecontext:ToolUseContext, **kwargs) -> ToolResult:
+    def execute(self, ctx: AgentRunContext, **kwargs) -> ToolResult:
         input = FileEditInput(**kwargs)
         fullpath = Path(utils.expandPath(input.file_path))
         fullpath_str = str(fullpath)
@@ -99,7 +108,7 @@ class EditTool(BaseTool):
                 read_timestamp=int(datetime.now().timestamp()),
                 modify_timestamp=new_mtime,
             )
-            toolusecontext.filecachestate.set(fullpath_str, new_file_state)
+            ctx.filecachestate.set(fullpath_str, new_file_state)
             return ToolResult(
                 success=True,
                 data=FileEditOutput(
@@ -111,12 +120,12 @@ class EditTool(BaseTool):
                 )
             )
         #here for path exsist and we need to do the actual replacement for content
-        if not toolusecontext.filecachestate.has(fullpath_str):
+        if not ctx.filecachestate.has(fullpath_str):
                 return ToolResult(
                     success=False,
                     error="File has not been read yet. Read it first before writing to it."
                 )
-        file_cache_state = toolusecontext.filecachestate.get_file_state(fullpath_str)
+        file_cache_state = ctx.filecachestate.get_file_state(fullpath_str)
         latest_mtime = int(os.path.getmtime(fullpath))
         if latest_mtime > file_cache_state.modify_timestamp: # type: ignore
             return ToolResult(
@@ -124,22 +133,20 @@ class EditTool(BaseTool):
                 error="File has been modified since read, either by the user or by a linter. Read it again before attempting to write it."
             )
 
-        original_content = fullpath.read_text(encoding="utf-8")
-        if input.old_string not in original_content:
-            return ToolResult(
-                success=False,
-                error=f"old_string not find in {fullpath_str}"
-            )
-        if not input.replace_all and original_content.count(input.old_string) >1 :
+        original_content = file_cache_state.content # type: ignore
+        count = original_content.count(input.old_string)
+        if count == 0:
+            return ToolResult(success=False, error=f"old_string not found in {fullpath_str}")
+        if not input.replace_all and count >1 :
             return ToolResult(
                 success=False,
                 error=f"old_string is not unique in {fullpath_str}"
             )
         new_content = original_content.replace(input.old_string, input.new_string) if input.replace_all \
                     else original_content.replace(input.old_string, input.new_string, 1)
-        fullpath.write_text(new_content)
+        fullpath.write_text(new_content, encoding="utf-8")
         new_mtime = int(os.path.getmtime(fullpath_str))
-        toolusecontext.filecachestate.set(fullpath_str, FileState(
+        ctx.filecachestate.set(fullpath_str, FileState(
             content=new_content,
             read_timestamp=int(datetime.now().timestamp()),
             modify_timestamp=new_mtime,

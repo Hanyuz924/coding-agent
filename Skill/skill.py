@@ -1,5 +1,6 @@
-from pathlib import Path
+# stdlib
 from dataclasses import dataclass, field
+from pathlib import Path
 
 
 @dataclass
